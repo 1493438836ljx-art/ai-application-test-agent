@@ -1,0 +1,25 @@
+{
+  "name": "claude-code-restful-api",
+  "version": "1.0.0",
+  "description": "将Claude Code封装成可通过Postman调用的RESTful API",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "keywords": [
+    "claude",
+    "restful",
+    "api",
+    "postman"
+  ],
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "multer": "^1.4.5-lts.1",
+    "adm-zip": "^0.5.10"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  }
+}

@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Skill
+metadata:
+  name: restful-api-dangerous
+  version: 2.0.0
+  description: Claude Code RESTful API (危险模式 - 通用任务执行接口，支持Skill文件上传)
+spec:
+  type: cli
+  runtime: node
+  entrypoint: index.js
+  permissions:
+    - network
+    - file:read
+    - file:write
+    - file:delete
+    - execute:dangerously
+  dangerouslySkipPermission: true
