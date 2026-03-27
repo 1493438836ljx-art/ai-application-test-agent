@@ -306,6 +306,297 @@ app.post('/api/task', upload.single('skillFile'), async (req, res) => {
     }
 });
 
+/**
+ * 流式任务执行接口
+ * 使用 SSE (Server-Sent Events) 实时返回 Claude Code 的输出
+ * 支持的入参与 /api/task 相同
+ */
+app.post('/api/task/stream', upload.single('skillFile'), async (req, res) => {
+    const requestStartTime = Date.now();
+    const requestTimestamp = formatTimestamp();
+    const { config, sessionId } = req.body;
+    let taskContent = req.body.taskContent;
+    const skillFile = req.file;
+
+    // 验证必填参数
+    if (!taskContent) {
+        console.log(`[${requestTimestamp}] [STREAM] 任务执行失败: 缺少 taskContent 参数`);
+        return res.status(400).json({ error: 'taskContent参数是必需的' });
+    }
+
+    // 记录请求开始日志
+    console.log('─'.repeat(60));
+    console.log(`[${requestTimestamp}] [STREAM] 收到流式任务执行请求`);
+    console.log(`  - 任务内容摘要: ${taskContent.substring(0, 100)}${taskContent.length > 100 ? '...' : ''}`);
+    console.log(`  - 传入会话ID: ${sessionId || '(无，将创建新会话)'}`);
+
+    // 设置 SSE 响应头
+    res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no'
+    });
+
+    // 连接状态标志 - 必须在 sendEvent 函数之前定义
+    let closed = false;
+
+    // 发送 SSE 辅助函数（带错误处理）
+    const sendEvent = (type, data = {}) => {
+        try {
+            if (closed) {
+                console.log(`[${formatTimestamp()}] [STREAM] 跳过发送，连接已关闭, type=${type}`);
+                return false;
+            }
+            const message = `data: ${JSON.stringify({ type, ...data })}\n\n`;
+            const writeResult = res.write(message);
+            console.log(`[${formatTimestamp()}] [STREAM] 发送事件: type=${type}, writeResult=${writeResult}`);
+
+            // 立即刷新缓冲区，确保数据实时发送
+            if (typeof res.flush === 'function') {
+                res.flush();
+                console.log(`[${formatTimestamp()}] [STREAM] 缓冲区已刷新`);
+            }
+            return true;
+        } catch (writeError) {
+            console.error(`[${formatTimestamp()}] [STREAM ERROR] 写入失败: ${writeError.message}`);
+                closed = true;
+                return false;
+            }
+    };
+
+    try {
+        // 构建流式命令 (--verbose 是 stream-json 所必需的)
+        let claudeCommand = `claude code -p --output-format stream-json --verbose ${CLAUDE_FLAGS}`;
+
+        // 处理 sessionId
+        let effectiveSessionId = sessionId && sessionId.trim() !== '' ? sessionId.trim() : null;
+
+        if (effectiveSessionId) {
+            claudeCommand += ` --resume "${effectiveSessionId}"`;
+            console.log(`[${formatTimestamp()}] [STREAM] 恢复会话ID: ${effectiveSessionId}`);
+        } else {
+            effectiveSessionId = generateUUID();
+            claudeCommand += ` --session-id "${effectiveSessionId}"`;
+            console.log(`[${formatTimestamp()}] [STREAM] 创建新会话ID: ${effectiveSessionId}`);
+        }
+
+        // 处理配置信息
+        if (config) {
+            try {
+                const configObj = typeof config === 'string' ? JSON.parse(config) : config;
+                Object.keys(configObj).forEach(key => {
+                    taskContent += `\n\n配置 ${key}: ${JSON.stringify(configObj[key])}`;
+                });
+            } catch (e) {
+                console.error(`[${formatTimestamp()}] [STREAM ERROR] 配置解析失败: ${e.message}`);
+            }
+        }
+
+        // 处理 Skill 文件
+        let skillDir = null;
+        if (skillFile) {
+            try {
+                const zip = new AdmZip(skillFile.path);
+                const extractDir = path.resolve(path.join('uploads', 'skill-' + Date.now()));
+                zip.extractAllTo(extractDir, true);
+                skillDir = extractDir;
+                console.log(`[${formatTimestamp()}] [STREAM] Skill文件解压至: ${extractDir}`);
+
+                const manifestPath = path.join(extractDir, 'skill-manifest.yaml');
+                if (fs.existsSync(manifestPath)) {
+                    taskContent += `\n\n---\n请使用以下路径中的自定义Skill: ${extractDir}`;
+                    taskContent += `\nSkill清单文件位于: ${manifestPath}`;
+                    taskContent += `\n---`;
+                }
+
+                const normalizedPath = extractDir.replace(/\\/g, '/');
+                claudeCommand += ` --add-dir "${normalizedPath}"`;
+            } catch (e) {
+                console.error(`[${formatTimestamp()}] [STREAM ERROR] Skill文件解压失败: ${e.message}`);
+            }
+        }
+
+        // 发送开始事件
+        sendEvent('start', { sessionId: effectiveSessionId });
+
+        // 执行 Claude 命令
+        const claudeProcess = spawn('powershell.exe', [
+            '-ExecutionPolicy', 'Bypass',
+            '-Command', claudeCommand
+        ], {
+            shell: false,
+            stdio: ['pipe', 'pipe', 'pipe'],
+            env: { ...process.env, NODE_ENV: 'production' }
+        });
+
+        // 设置超时
+        const timeoutId = setTimeout(() => {
+            if (closed) return;
+            closed = true;
+            claudeProcess.kill();
+            sendEvent('error', { message: '任务执行超时' });
+            res.end();
+            console.log(`[${formatTimestamp()}] [STREAM] 任务执行超时`);
+        }, 600000);
+
+        // 辅助函数：从 Claude stream-json 格式中提取文本内容
+        // 返回 { content, contentType } 或 null
+        // contentType: 'thinking' | 'text' | 'tool_use' | 'result'
+        const extractContent = (parsed) => {
+            // 直接文本输出
+            if (parsed.type === 'result' && parsed.result) {
+                return { content: parsed.result, contentType: 'result' };
+            }
+
+            // assistant 消息，需要从 message.content 数组提取
+            if (parsed.type === 'assistant' && parsed.message?.content) {
+                const results = [];
+                for (const block of parsed.message.content) {
+                    if (block.type === 'thinking' && block.thinking) {
+                        results.push({ content: block.thinking, contentType: 'thinking' });
+                    } else if (block.type === 'text' && block.text) {
+                        results.push({ content: block.text, contentType: 'text' });
+                    } else if (block.type === 'tool_use') {
+                        results.push({
+                            content: `使用工具: ${block.name}`,
+                            contentType: 'tool_use',
+                            toolName: block.name,
+                            toolInput: block.input
+                        });
+                    }
+                }
+                // 如果有多个块，返回第一个（通常只有一个主要块）
+                return results.length > 0 ? results[0] : null;
+            }
+
+            // content_block_delta 类型
+            if (parsed.type === 'content_block_delta' && parsed.delta) {
+                if (parsed.delta.type === 'thinking_delta' && parsed.delta.thinking) {
+                    return { content: parsed.delta.thinking, contentType: 'thinking' };
+                } else if (parsed.delta.type === 'text_delta' && parsed.delta.text) {
+                    return { content: parsed.delta.text, contentType: 'text' };
+                }
+            }
+
+            // 其他情况，返回 null 表示不发送
+            return null;
+        };
+
+        // 实时流式输出 stdout
+        claudeProcess.stdout.on('data', (data) => {
+            const chunk = data.toString();
+            // 尝试解析 stream-json 格式的输出
+            const lines = chunk.split('\n').filter(line => line.trim());
+            for (const line of lines) {
+                try {
+                    const parsed = JSON.parse(line);
+
+                    // 跳过 system/init 类型的消息，不需要发送给用户
+                    if (parsed.type === 'system') {
+                        console.log(`[${formatTimestamp()}] [STREAM] 跳过 system 消息: subtype=${parsed.subtype}`);
+                        continue;
+                    }
+
+                    // 提取实际内容
+                    const extracted = extractContent(parsed);
+                    if (extracted) {
+                        sendEvent('chunk', {
+                            content: extracted.content,
+                            contentType: extracted.contentType,
+                            toolName: extracted.toolName,
+                            toolInput: extracted.toolInput
+                        });
+                    }
+                } catch (e) {
+                    // 不是 JSON，直接发送原始内容
+                    if (line.trim()) {
+                        sendEvent('chunk', { content: line });
+                    }
+                }
+            }
+        });
+
+        // 处理 stderr
+        claudeProcess.stderr.on('data', (data) => {
+            const chunk = data.toString();
+            console.error(`[${formatTimestamp()}] [STREAM STDERR] ${chunk}`);
+            // 不作为错误发送，因为 Claude 可能会在 stderr 输出一些信息性内容
+        });
+
+        // 进程结束
+        claudeProcess.on('close', (code) => {
+            if (closed) return;
+            closed = true;
+            clearTimeout(timeoutId);
+
+            const duration = Date.now() - requestStartTime;
+
+            // 清理临时文件
+            if (skillFile && fs.existsSync(skillFile.path)) {
+                fs.unlinkSync(skillFile.path);
+            }
+
+            if (code === 0) {
+                console.log(`[${formatTimestamp()}] [STREAM] 任务执行成功，耗时: ${duration}ms`);
+                sendEvent('done', { sessionId: effectiveSessionId, duration });
+            } else {
+                console.log(`[${formatTimestamp()}] [STREAM] 任务执行失败，退出码: ${code}`);
+                sendEvent('error', { message: `任务执行失败，退出码: ${code}`, sessionId: effectiveSessionId });
+            }
+
+            console.log('─'.repeat(60));
+            res.end();
+        });
+
+        // 进程错误
+        claudeProcess.on('error', (err) => {
+            if (closed) return;
+            closed = true;
+            clearTimeout(timeoutId);
+            console.error(`[${formatTimestamp()}] [STREAM ERROR] 进程错误: ${err.message}`);
+            sendEvent('error', { message: err.message });
+            res.end();
+        });
+
+        // 通过 stdin 传递任务内容
+        claudeProcess.stdin.write(taskContent);
+        claudeProcess.stdin.end();
+
+        // 处理客户端断开连接 - 对于 SSE 应该监听 res.on('close')
+        // 注意：req.on('close') 对于 POST 请求会在请求体接收完成时触发，而不是客户端断开时
+        res.on('close', () => {
+            if (!closed) {
+                console.log(`[${formatTimestamp()}] [STREAM] 客户端断开连接 (res.on('close') 触发)`);
+                closed = true;
+                clearTimeout(timeoutId);
+                claudeProcess.kill();
+            }
+        });
+
+        // 同时监听 socket 关闭事件作为备用
+        req.socket.on('close', () => {
+            if (!closed) {
+                console.log(`[${formatTimestamp()}] [STREAM] Socket 关闭`);
+                closed = true;
+                clearTimeout(timeoutId);
+                claudeProcess.kill();
+            }
+        });
+
+    } catch (error) {
+        const duration = Date.now() - requestStartTime;
+        console.error(`[${formatTimestamp()}] [STREAM ERROR] ${error.message}`);
+        sendEvent('error', { message: error.message });
+        res.end();
+
+        if (skillFile && fs.existsSync(skillFile.path)) {
+            fs.unlinkSync(skillFile.path);
+        }
+        console.log('─'.repeat(60));
+    }
+});
+
 // 启动服务器
 app.listen(PORT, () => {
     console.log('='.repeat(60));
@@ -321,12 +612,19 @@ app.listen(PORT, () => {
     console.log('可用端点:');
     console.log(`  GET  http://localhost:${PORT}/health                 - 健康检查`);
     console.log(`  POST http://localhost:${PORT}/api/task                - 通用任务执行接口`);
+    console.log(`  POST http://localhost:${PORT}/api/task/stream         - 流式任务执行接口 (SSE)`);
     console.log('');
     console.log('任务执行接口参数:');
     console.log('  - taskContent (必填): 任务内容字符串');
     console.log('  - config (可选): 配置信息JSON');
     console.log('  - skillFile (可选): Skill文件zip格式');
     console.log('  - sessionId (可选): 会话ID，用于多轮对话会话持久化');
+    console.log('');
+    console.log('流式接口 (/api/task/stream) 返回 SSE 事件:');
+    console.log('  - start: { type: "start", sessionId: "..." }');
+    console.log('  - chunk: { type: "chunk", content: "..." }');
+    console.log('  - done:  { type: "done", sessionId: "...", duration: ... }');
+    console.log('  - error: { type: "error", message: "..." }');
     console.log('');
     console.log('多轮会话使用方式:');
     console.log('  1. 首次调用不传 sessionId，响应中会返回新创建的 sessionId');
