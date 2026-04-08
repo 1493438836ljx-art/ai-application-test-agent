@@ -2,10 +2,12 @@ const express = require('express');
 const { spawn } = require('child_process');
 const cors = require('cors');
 const multer = require('multer');
-const AdmZip = require('adm-zip');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+
+// 导入安全工具
+const { isValidSessionId, validatePath, SafeZipExtractor, cleanupExpiredFiles, buildClaudeArgs } = require('./utils/security');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -15,8 +17,95 @@ function generateUUID() {
     return crypto.randomUUID();
 }
 
-// Claude Code 命令配置（最高权限）
-const CLAUDE_FLAGS = '--dangerously-skip-permissions';
+// 内容去重：存储已发送内容的哈希值（每个请求独立）
+const contentDedupMap = new Map(); // sessionId -> Set<contentHash>
+
+/**
+ * 获取或创建会话的去重集合
+ */
+function getDedupSet(sessionId) {
+    if (!contentDedupMap.has(sessionId)) {
+        contentDedupMap.set(sessionId, new Set());
+    }
+    return contentDedupMap.get(sessionId);
+}
+
+/**
+ * 清理会话的去重集合
+ */
+function clearDedupSet(sessionId) {
+    contentDedupMap.delete(sessionId);
+}
+
+/**
+ * 检查内容是否已发送过（去重）
+ * @param {string} sessionId - 会话ID
+ * @param {string} content - 内容
+ * @param {number} minLen - 最小去重长度（短于这个长度的内容不去重）
+ * @returns {boolean} - true 表示是重复内容，应跳过
+ */
+function isDuplicateContent(sessionId, content, minLen = 20) {
+    if (!content || content.length < minLen) {
+        return false; // 短内容不去重
+    }
+    const dedupSet = getDedupSet(sessionId);
+    // 标准化内容：去除多余空白、统一换行符
+    const normalizedContent = content.trim().replace(/\s+/g, ' ');
+    const contentHash = crypto.createHash('md5').update(normalizedContent).digest('hex');
+
+    if (dedupSet.has(contentHash)) {
+        return true; // 重复内容
+    }
+    dedupSet.add(contentHash);
+    return false;
+}
+
+/**
+ * 清理隔离的临时工作目录
+ * @param {string} workDir - 工作目录路径
+ * @param {string} sessionId - 会话ID
+ */
+function cleanupTempWorkDir(workDir, sessionId) {
+    try {
+        if (workDir && fs.existsSync(workDir)) {
+            fs.rmSync(workDir, { recursive: true, force: true });
+            console.log(`[${formatTimestamp()}] [ISOLATE] 清理隔离工作目录: ${workDir}`);
+        }
+        // 同时清理去重集合
+        clearDedupSet(sessionId);
+    } catch (e) {
+        console.error(`[${formatTimestamp()}] [ISOLATE ERROR] 清理失败: ${e.message}`);
+    }
+}
+
+/**
+ * 清理旧的隔离会话目录（保留最近 1 小时的）
+ */
+function cleanupOldSessionDirs() {
+    const sessionsBaseDir = path.join('uploads', 'sessions');
+    if (!fs.existsSync(sessionsBaseDir)) {
+        return;
+    }
+
+    const now = Date.now();
+    const maxAge = 60 * 60 * 1000; // 1 小时
+
+    try {
+        const entries = fs.readdirSync(sessionsBaseDir, { withFileTypes: true });
+        for (const entry of entries) {
+            if (entry.isDirectory() && entry.name.startsWith('session-')) {
+                const dirPath = path.join(sessionsBaseDir, entry.name);
+                const stat = fs.statSync(dirPath);
+                if (now - stat.mtimeMs > maxAge) {
+                    fs.rmSync(dirPath, { recursive: true, force: true });
+                    console.log(`[${formatTimestamp()}] [CLEANUP] 清理过期隔离目录: ${entry.name}`);
+                }
+            }
+        }
+    } catch (e) {
+        console.error(`[${formatTimestamp()}] [CLEANUP ERROR] 清理过期目录失败: ${e.message}`);
+    }
+}
 
 // 配置文件上传
 const upload = multer({
@@ -41,8 +130,14 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// 临时存储解压的技能文件
-let currentSkillPath = null;
+// 启动时清理过期文件
+cleanupExpiredFiles('./uploads/skills', 60 * 60 * 1000);  // 清理 1 小时前的 skill 文件
+cleanupOldSessionDirs();  // 清理过期的隔离会话目录
+
+// 定期清理（每 10 分钟）
+setInterval(() => {
+    cleanupOldSessionDirs();
+}, 10 * 60 * 1000);
 
 /**
  * 健康检查
@@ -51,9 +146,7 @@ app.get('/health', (req, res) => {
     res.json({
         status: 'ok',
         uptime: process.uptime(),
-        dangerouslySkipPermission: true,
-        mode: 'CLAUDE_DANGEROUS_MODE',
-        claudeFlags: CLAUDE_FLAGS
+        securityEnabled: true
     });
 });
 
@@ -65,18 +158,207 @@ function formatTimestamp() {
 }
 
 /**
- * 任务执行接口（通用）
+ * 通用 SSE 辅助函数
+ */
+function setupSSE(req, res) {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+}
+
+/**
+ * 发送 SSE 事件
+ * 注意：将 eventType 也放入 data 中，以便 Java 后端能够正确解析 type 字段
+ */
+function sendEvent(res, eventType, data) {
+    // 确保 data 中包含 type 字段
+    const dataWithType = {
+        type: eventType,
+        ...data
+    };
+    res.write(`event: ${eventType}\n`);
+    res.write(`data: ${JSON.stringify(dataWithType)}\n\n`);
+}
+
+/**
+ * 从 stream-json 格式中提取内容
+ * 只提取纯文本内容，过滤思考过程和工具调用
+ */
+function extractContent(parsed) {
+    // assistant 类型 - Claude 的响应消息
+    if (parsed.type === 'assistant') {
+        // Claude CLI stream-json 格式中，内容在 message 对象里
+        // 结构: { type: "assistant", message: { content: [...], role: "assistant", ... }, ... }
+        if (parsed.message && typeof parsed.message === 'object') {
+            const msg = parsed.message;
+            // message.content 通常是数组
+            if (Array.isArray(msg.content)) {
+                const textContent = [];
+                for (const item of msg.content) {
+                    // 只提取 text 类型，过滤 thinking 和 tool_use
+                    if (item.type === 'text' && item.text) {
+                        textContent.push(item.text);
+                    }
+                }
+                if (textContent.length > 0) {
+                    return { content: textContent.join('\n'), contentType: 'assistant' };
+                }
+            }
+            // 如果 message.content 是字符串
+            if (typeof msg.content === 'string') {
+                return { content: msg.content, contentType: 'assistant' };
+            }
+        }
+
+        // 兼容旧格式：直接在 parsed.content 中
+        if (parsed.content) {
+            if (Array.isArray(parsed.content)) {
+                const textContent = [];
+                for (const item of parsed.content) {
+                    // 只提取 text 类型
+                    if (item.type === 'text' && item.text) {
+                        textContent.push(item.text);
+                    }
+                }
+                if (textContent.length > 0) {
+                    return { content: textContent.join('\n'), contentType: 'assistant' };
+                }
+            } else if (typeof parsed.content === 'string') {
+                return { content: parsed.content, contentType: 'assistant' };
+            }
+        }
+
+        // 没有可提取的内容
+        return { content: '', contentType: 'assistant' };
+    }
+
+    // user 类型 - 用户消息（通常是工具结果）
+    // 过滤掉工具结果，只保留纯文本
+    if (parsed.type === 'user') {
+        // 检查是否内容在 message 对象中
+        if (parsed.message && typeof parsed.message === 'object') {
+            const msg = parsed.message;
+            if (msg.content && Array.isArray(msg.content)) {
+                const textContent = [];
+                for (const item of msg.content) {
+                    // 只提取字符串类型的文本，跳过 tool_result
+                    if (typeof item === 'string') {
+                        textContent.push(item);
+                    } else if (item.type === 'text' && item.text) {
+                        textContent.push(item.text);
+                    }
+                }
+                if (textContent.length > 0) {
+                    return { content: textContent.join('\n'), contentType: 'user' };
+                }
+            } else if (typeof msg.content === 'string') {
+                return { content: msg.content, contentType: 'user' };
+            }
+        }
+
+        // 兼容旧格式
+        if (parsed.content) {
+            if (typeof parsed.content === 'string') {
+                return { content: parsed.content, contentType: 'user' };
+            } else if (Array.isArray(parsed.content)) {
+                const textContent = [];
+                for (const item of parsed.content) {
+                    if (typeof item === 'string') {
+                        textContent.push(item);
+                    } else if (item.text) {
+                        textContent.push(item.text);
+                    }
+                }
+                if (textContent.length > 0) {
+                    return { content: textContent.join('\n'), contentType: 'user' };
+                }
+            }
+        }
+
+        // user 类型没有可提取的纯文本内容
+        return { content: '', contentType: 'user' };
+    }
+
+    // message 类型 - Claude API 的主要消息格式
+    if (parsed.type === 'message' && Array.isArray(parsed.content)) {
+        const textContent = [];
+        for (const item of parsed.content) {
+            // 只提取 text 类型
+            if (item.type === 'text' && item.text) {
+                textContent.push(item.text);
+            }
+        }
+        if (textContent.length > 0) {
+            return { content: textContent.join('\n'), contentType: 'message' };
+        }
+        return { content: '', contentType: 'message' };
+    }
+
+    // tool_use 类型 - 不发送给前端
+    if (parsed.type === 'tool_use') {
+        return { content: '', contentType: 'tool_use' };
+    }
+
+    // result 类型 - 这是最终结果，需要发送
+    if (parsed.type === 'result') {
+        let content = '';
+        if (parsed.content) {
+            content = typeof parsed.content === 'string'
+                ? parsed.content
+                : JSON.stringify(parsed.content, null, 2);
+        } else if (parsed.result) {
+            content = typeof parsed.result === 'string'
+                ? parsed.result
+                : JSON.stringify(parsed.result, null, 2);
+        }
+        return { content: content, contentType: 'result' };
+    }
+
+    // text 类型 - 发送纯文本
+    if (parsed.type === 'text' || parsed.subtype === 'text') {
+        return {
+            content: parsed.text || (typeof parsed.content === 'string' ? parsed.content : '') || '',
+            contentType: 'text'
+        };
+    }
+
+    // thinking 类型 - 不发送给前端
+    if (parsed.type === 'thinking' || parsed.subtype === 'thinking') {
+        return { content: '', contentType: 'thinking' };
+    }
+
+    // 默认 - 确保返回字符串
+    let defaultContent = '';
+    if (typeof parsed.content === 'string') {
+        defaultContent = parsed.content;
+    } else if (typeof parsed.text === 'string') {
+        defaultContent = parsed.text;
+    } else if (typeof parsed.message === 'string') {
+        defaultContent = parsed.message;
+    } else if (parsed.content) {
+        defaultContent = JSON.stringify(parsed.content);
+    }
+
+    return {
+        content: defaultContent,
+        contentType: parsed.type || 'text'
+    };
+}
+
+/**
+ * 流式任务执行接口 (SSE)
  * 支持的入参：
  * 1. taskContent: 任务内容（String，必填）
  * 2. config: 配置信息（JSON，非必填）
  * 3. skillFile: Skill文件（zip文件，非必填）
  * 4. sessionId: 会话ID（String，非必填）- 用于多轮对话会话持久化
  */
-app.post('/api/task', upload.single('skillFile'), async (req, res) => {
+app.post('/api/task/stream', upload.single('skillFile'), async (req, res) => {
     const requestStartTime = Date.now();
     const requestTimestamp = formatTimestamp();
-    const { config, sessionId } = req.body;
-    let taskContent = req.body.taskContent;  // 使用 let 以便后续修改
+    const { config, sessionId: inputSessionId } = req.body;
+    let taskContent = req.body.taskContent;
     const skillFile = req.file;
 
     // 验证必填参数
@@ -85,38 +367,45 @@ app.post('/api/task', upload.single('skillFile'), async (req, res) => {
         return res.status(400).json({ error: 'taskContent参数是必需的' });
     }
 
+    // 验证 sessionId 格式（如果提供了）
+    if (inputSessionId && !isValidSessionId(inputSessionId)) {
+        console.log(`[${requestTimestamp}] [REQUEST] 无效的 sessionId 格式: ${inputSessionId}`);
+        return res.status(400).json({
+            error: '无效的sessionId格式，只接受UUID格式',
+            code: 'INVALID_SESSION_ID'
+        });
+    }
+
     // 记录请求开始日志
     console.log('─'.repeat(60));
     console.log(`[${requestTimestamp}] [REQUEST] 收到任务执行请求`);
     console.log(`  - 任务内容摘要: ${taskContent.substring(0, 100)}${taskContent.length > 100 ? '...' : ''}`);
-    console.log(`  - 传入会话ID: ${sessionId || '(无，将创建新会话)'}`);
+    console.log(`  - 传入会话ID: ${inputSessionId || '(无，将创建新会话)'}`);
     console.log(`  - 配置信息: ${config ? '有' : '无'}`);
     console.log(`  - Skill文件: ${skillFile ? skillFile.originalname : '无'}`);
 
     try {
-        // 使用 -p 和 --output-format json 获取结构化输出（包含 session_id）
-        let claudeCommand = `claude code -p --output-format json ${CLAUDE_FLAGS}`;
+        // 准备会话ID
+        let effectiveSessionId = inputSessionId;
+        let isNewSession = !effectiveSessionId;
 
-        // 处理 sessionId（多轮会话支持）
-        let effectiveSessionId = sessionId && sessionId.trim() !== '' ? sessionId.trim() : null;
-
-        if (effectiveSessionId) {
-            // 使用 --resume 参数恢复已有会话
-            claudeCommand += ` --resume "${effectiveSessionId}"`;
-            console.log(`[${formatTimestamp()}] [SESSION] 恢复会话ID: ${effectiveSessionId}`);
-        } else {
-            // 新会话：生成 UUID 并使用 --session-id 参数
-            // 这样可以确保会话被正确持久化
+        if (isNewSession) {
             effectiveSessionId = generateUUID();
-            claudeCommand += ` --session-id "${effectiveSessionId}"`;
             console.log(`[${formatTimestamp()}] [SESSION] 创建新会话ID: ${effectiveSessionId}`);
+        } else {
+            console.log(`[${formatTimestamp()}] [SESSION] 恢复会话ID: ${effectiveSessionId}`);
         }
+
+        // 设置 SSE
+        setupSSE(req, res);
+
+        // 发送开始事件
+        sendEvent(res, 'start', { sessionId: effectiveSessionId });
 
         // 处理配置信息
         if (config) {
             try {
                 const configObj = typeof config === 'string' ? JSON.parse(config) : config;
-                // 将配置信息添加到任务内容中
                 Object.keys(configObj).forEach(key => {
                     taskContent += `\n\n配置 ${key}: ${JSON.stringify(configObj[key])}`;
                 });
@@ -126,392 +415,129 @@ app.post('/api/task', upload.single('skillFile'), async (req, res) => {
             }
         }
 
-        // 处理Skill文件（zip）
+        // ========================================
+        // 方案 A：使用隔离的临时工作目录
+        // ========================================
+
+        // 创建临时工作目录（用于隔离每次请求）
+        const tempWorkDir = path.join('uploads', 'sessions', 'session-' + effectiveSessionId);
+        if (!fs.existsSync(tempWorkDir)) {
+            fs.mkdirSync(tempWorkDir, { recursive: true });
+            console.log(`[${formatTimestamp()}] [ISOLATE] 创建隔离工作目录: ${tempWorkDir}`);
+        }
+
+        // 安全处理 Skill 文件
         let skillDir = null;
         if (skillFile) {
             try {
-                // 解压zip文件
-                const zip = new AdmZip(skillFile.path);
-                const extractDir = path.resolve(path.join('uploads', 'skill-' + Date.now()));
-                zip.extractAllTo(extractDir, true);
-                skillDir = extractDir;
-                console.log(`[${formatTimestamp()}] [SKILL] Skill文件解压至: ${extractDir}`);
+                // 将 Skill 解压到隔离工作目录中的 skill 子目录
+                const extractDir = path.join(tempWorkDir, 'skill');
+                const extractor = new SafeZipExtractor(extractDir);
 
-                // 检查skill目录结构，查找skill文件
-                const skillFiles = [];
-                const manifestPath = path.join(extractDir, 'skill-manifest.yaml');
-                const hasManifest = fs.existsSync(manifestPath);
+                const result = extractor.extract(skillFile.path);
+                skillDir = result.targetDir;
+                console.log(`[${formatTimestamp()}] [SKILL] Skill文件安全解压至隔离目录: ${extractDir}`);
+                console.log(`[${formatTimestamp()}] [SKILL] 解压文件: ${result.files.join(', ')}`);
 
-                // 遍历解压目录，查找可能的skill文件
-                const files = fs.readdirSync(extractDir);
-                files.forEach(file => {
-                    const filePath = path.join(extractDir, file);
-                    const stat = fs.statSync(filePath);
-                    if (stat.isFile()) {
-                        skillFiles.push({ name: file, path: filePath });
-                    } else if (stat.isDirectory()) {
-                        // 检查子目录中的文件
-                        const subFiles = fs.readdirSync(filePath);
-                        subFiles.forEach(subFile => {
-                            skillFiles.push({ name: subFile, path: path.join(filePath, subFile) });
-                        });
-                    }
+            } catch (extractError) {
+                console.error(`[${formatTimestamp()}] [SKILL ERROR] 解压失败: ${extractError.message}`);
+                sendEvent(res, 'error', {
+                    message: 'Skill文件安全验证失败: ' + extractError.message,
+                    code: 'SKILL_SECURITY_ERROR'
                 });
-                console.log(`[${formatTimestamp()}] [SKILL] 发现文件: ${skillFiles.map(f => f.name).join(', ')}`);
-
-                // 在taskContent中添加明确的skill使用指示
-                if (hasManifest) {
-                    taskContent += `\n\n---\n请使用以下路径中的自定义Skill: ${extractDir}`;
-                    taskContent += `\nSkill清单文件位于: ${manifestPath}`;
-                    taskContent += `\n请先读取skill-manifest.yaml了解skill的结构和用法，然后按照其中的定义执行任务。`;
-                    taskContent += `\n---`;
-                } else {
-                    // 没有manifest时，也添加skill目录信息
-                    taskContent += `\n\n---\n请使用以下路径中的自定义Skill: ${extractDir}`;
-                    taskContent += `\nSkill文件: ${skillFiles.map(f => f.name).join(', ')}`;
-                    taskContent += `\n---`;
+                res.end();
+                // 清理隔离目录
+                cleanupTempWorkDir(tempWorkDir, effectiveSessionId);
+                return;
+            } finally {
+                // 清理上传的临时文件
+                if (fs.existsSync(skillFile.path)) {
+                    fs.unlinkSync(skillFile.path);
                 }
-
-                // 使用 --add-dir 参数添加 skill 目录访问权限（使用绝对路径）
-                // 将Windows路径中的反斜杠替换为正斜杠，避免PowerShell解析问题
-                const normalizedPath = extractDir.replace(/\\/g, '/');
-                claudeCommand += ` --add-dir "${normalizedPath}"`;
-                console.log(`[${formatTimestamp()}] [SKILL] 添加目录参数: --add-dir "${normalizedPath}"`);
-            } catch (e) {
-                console.error(`[${formatTimestamp()}] [ERROR] Skill文件解压失败: ${e.message}`);
             }
         }
 
-        // 执行Claude命令
-        // 注意：不改变 cwd，保持工作目录一致以确保会话持久化正常工作
-        const claudeProcess = spawn('powershell.exe', [
-            '-ExecutionPolicy', 'Bypass',
-            '-Command', claudeCommand
-        ], {
-            shell: false,
-            stdio: ['pipe', 'pipe', 'pipe'],
-            env: { ...process.env, NODE_ENV: 'production' }
+        // 清理旧的隔离工作目录（保留最近 1 小时的）
+        cleanupOldSessionDirs();
+
+        // 使用安全的方式构建 Claude CLI 参数
+        let claudeArgs;
+        try {
+            claudeArgs = buildClaudeArgs({
+                sessionId: effectiveSessionId,
+                resume: !isNewSession,
+                verbose: true,
+                skillDir: skillDir,
+                outputFormat: 'stream-json',
+                dangerouslySkipPermissions: true  // 注意：生产环境应移除此选项
+            });
+        } catch (argError) {
+            console.error(`[${formatTimestamp()}] [ERROR] 参数构建失败: ${argError.message}`);
+            sendEvent(res, 'error', {
+                message: argError.message,
+                code: 'ARGUMENT_ERROR'
+            });
+            res.end();
+            // 清理隔离目录
+            cleanupTempWorkDir(tempWorkDir, effectiveSessionId);
+            return;
+        }
+
+        console.log(`[${formatTimestamp()}] [EXECUTE] 执行命令: ${claudeArgs[0]} ${claudeArgs.slice(1, 5).join(' ')}...`);
+        console.log(`[${formatTimestamp()}] [ISOLATE] 使用隔离工作目录: ${tempWorkDir}`);
+
+        // 在 Windows 上需要使用 shell 来执行 .cmd 文件
+        // 使用 shell: true 是安全的，因为参数已经通过数组传递（不是字符串拼接）
+        const isWindows = process.platform === 'win32';
+        const claudeProcess = spawn(claudeArgs[0], claudeArgs.slice(1), {
+            cwd: tempWorkDir,  // 使用隔离工作目录，而非项目根目录
+            env: process.env,
+            shell: isWindows  // Windows 上需要 shell 来执行 .cmd/.bat 文件
         });
 
-        let output = '';
-        let errorOutput = '';
-        let responseSent = false; // 标记响应是否已发送
-
-        // 设置超时
+        let closed = false;
         const timeoutId = setTimeout(() => {
-            if (responseSent) return;
-            responseSent = true;
-
-            const duration = Date.now() - requestStartTime;
-            claudeProcess.kill();
-
-            console.log(`[${formatTimestamp()}] [RESPONSE] 任务执行超时`);
-            console.log(`  - 会话ID: ${effectiveSessionId}`);
-            console.log(`  - 执行耗时: ${duration}ms (已超时)`);
-            console.log('─'.repeat(60));
-
-            res.status(504).json({ error: '任务执行超时', sessionId: effectiveSessionId, duration: duration });
+            if (!closed) {
+                console.log(`[${formatTimestamp()}] [TIMEOUT] 任务执行超时`);
+                claudeProcess.kill();
+            }
         }, 600000); // 10分钟超时
 
-        claudeProcess.stdout.on('data', (data) => {
-            output += data.toString();
-        });
-
-        claudeProcess.stderr.on('data', (data) => {
-            errorOutput += data.toString();
-        });
-
-        claudeProcess.on('close', async (code) => {
-            clearTimeout(timeoutId); // 清除超时定时器
-
-            if (responseSent) return; // 防止重复发送响应
-            responseSent = true;
-
-            const requestEndTime = Date.now();
-            const duration = requestEndTime - requestStartTime;
-
-            // 清理临时文件
-            if (skillFile && fs.existsSync(skillFile.path)) {
-                fs.unlinkSync(skillFile.path);
-            }
-
-            if (code === 0) {
-                // 尝试解析 JSON 输出提取 result
-                let responseResult = output;
-                let parsedJson = null;
-
-                try {
-                    parsedJson = JSON.parse(output);
-                    // 提取 result 字段作为响应内容
-                    if (parsedJson.result) {
-                        responseResult = parsedJson.result;
-                    }
-                } catch (e) {
-                    // 如果不是 JSON 格式，使用原始输出
-                    console.log(`[${formatTimestamp()}] [WARN] 输出不是 JSON 格式，使用原始输出`);
-                }
-
-                // 记录成功日志
-                console.log(`[${formatTimestamp()}] [RESPONSE] 任务执行成功`);
-                console.log(`  - 会话ID: ${effectiveSessionId}`);
-                console.log(`  - 执行耗时: ${duration}ms`);
-                console.log(`  - 响应内容摘要: ${responseResult.substring(0, 100)}${responseResult.length > 100 ? '...' : ''}`);
-                console.log('─'.repeat(60));
-
-                res.json({
-                    success: true,
-                    response: responseResult,
-                    taskContent,
-                    config: config ? JSON.stringify(config) : null,
-                    skillFile: skillFile ? skillFile.originalname : null,
-                    sessionId: effectiveSessionId,
-                    rawOutput: parsedJson, // 返回完整解析结果供调试
-                    duration: duration
-                });
-            } else {
-                // 记录失败日志
-                console.log(`[${formatTimestamp()}] [RESPONSE] 任务执行失败`);
-                console.log(`  - 会话ID: ${effectiveSessionId}`);
-                console.log(`  - 执行耗时: ${duration}ms`);
-                console.log(`  - 退出码: ${code}`);
-                console.log(`  - 错误信息: ${errorOutput || '任务执行失败'}`);
-                console.log('─'.repeat(60));
-
-                res.status(500).json({
-                    success: false,
-                    error: errorOutput || '任务执行失败',
-                    code,
-                    taskContent,
-                    sessionId: effectiveSessionId,
-                    duration: duration
-                });
-            }
-        });
-
-        // 通过 stdin 传递任务内容
-        claudeProcess.stdin.write(taskContent);
-        claudeProcess.stdin.end();
-
-    } catch (error) {
-        const duration = Date.now() - requestStartTime;
-        // 清理临时文件
-        if (req.file && fs.existsSync(req.file.path)) {
-            fs.unlinkSync(req.file.path);
-        }
-        console.log(`[${formatTimestamp()}] [RESPONSE] 任务执行异常`);
-        console.log(`  - 错误信息: ${error.message}`);
-        console.log(`  - 执行耗时: ${duration}ms`);
-        console.log('─'.repeat(60));
-        res.status(500).json({ error: error.message, duration: duration });
-    }
-});
-
-/**
- * 流式任务执行接口
- * 使用 SSE (Server-Sent Events) 实时返回 Claude Code 的输出
- * 支持的入参与 /api/task 相同
- */
-app.post('/api/task/stream', upload.single('skillFile'), async (req, res) => {
-    const requestStartTime = Date.now();
-    const requestTimestamp = formatTimestamp();
-    const { config, sessionId } = req.body;
-    let taskContent = req.body.taskContent;
-    const skillFile = req.file;
-
-    // 验证必填参数
-    if (!taskContent) {
-        console.log(`[${requestTimestamp}] [STREAM] 任务执行失败: 缺少 taskContent 参数`);
-        return res.status(400).json({ error: 'taskContent参数是必需的' });
-    }
-
-    // 记录请求开始日志
-    console.log('─'.repeat(60));
-    console.log(`[${requestTimestamp}] [STREAM] 收到流式任务执行请求`);
-    console.log(`  - 任务内容摘要: ${taskContent.substring(0, 100)}${taskContent.length > 100 ? '...' : ''}`);
-    console.log(`  - 传入会话ID: ${sessionId || '(无，将创建新会话)'}`);
-
-    // 设置 SSE 响应头
-    res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
-        'X-Accel-Buffering': 'no'
-    });
-
-    // 连接状态标志 - 必须在 sendEvent 函数之前定义
-    let closed = false;
-
-    // 发送 SSE 辅助函数（带错误处理）
-    const sendEvent = (type, data = {}) => {
-        try {
-            if (closed) {
-                console.log(`[${formatTimestamp()}] [STREAM] 跳过发送，连接已关闭, type=${type}`);
-                return false;
-            }
-            const message = `data: ${JSON.stringify({ type, ...data })}\n\n`;
-            const writeResult = res.write(message);
-            console.log(`[${formatTimestamp()}] [STREAM] 发送事件: type=${type}, writeResult=${writeResult}`);
-
-            // 立即刷新缓冲区，确保数据实时发送
-            if (typeof res.flush === 'function') {
-                res.flush();
-                console.log(`[${formatTimestamp()}] [STREAM] 缓冲区已刷新`);
-            }
-            return true;
-        } catch (writeError) {
-            console.error(`[${formatTimestamp()}] [STREAM ERROR] 写入失败: ${writeError.message}`);
-                closed = true;
-                return false;
-            }
-    };
-
-    try {
-        // 构建流式命令 (--verbose 是 stream-json 所必需的)
-        let claudeCommand = `claude code -p --output-format stream-json --verbose ${CLAUDE_FLAGS}`;
-
-        // 处理 sessionId
-        let effectiveSessionId = sessionId && sessionId.trim() !== '' ? sessionId.trim() : null;
-
-        if (effectiveSessionId) {
-            claudeCommand += ` --resume "${effectiveSessionId}"`;
-            console.log(`[${formatTimestamp()}] [STREAM] 恢复会话ID: ${effectiveSessionId}`);
-        } else {
-            effectiveSessionId = generateUUID();
-            claudeCommand += ` --session-id "${effectiveSessionId}"`;
-            console.log(`[${formatTimestamp()}] [STREAM] 创建新会话ID: ${effectiveSessionId}`);
-        }
-
-        // 处理配置信息
-        if (config) {
-            try {
-                const configObj = typeof config === 'string' ? JSON.parse(config) : config;
-                Object.keys(configObj).forEach(key => {
-                    taskContent += `\n\n配置 ${key}: ${JSON.stringify(configObj[key])}`;
-                });
-            } catch (e) {
-                console.error(`[${formatTimestamp()}] [STREAM ERROR] 配置解析失败: ${e.message}`);
-            }
-        }
-
-        // 处理 Skill 文件
-        let skillDir = null;
-        if (skillFile) {
-            try {
-                const zip = new AdmZip(skillFile.path);
-                const extractDir = path.resolve(path.join('uploads', 'skill-' + Date.now()));
-                zip.extractAllTo(extractDir, true);
-                skillDir = extractDir;
-                console.log(`[${formatTimestamp()}] [STREAM] Skill文件解压至: ${extractDir}`);
-
-                const manifestPath = path.join(extractDir, 'skill-manifest.yaml');
-                if (fs.existsSync(manifestPath)) {
-                    taskContent += `\n\n---\n请使用以下路径中的自定义Skill: ${extractDir}`;
-                    taskContent += `\nSkill清单文件位于: ${manifestPath}`;
-                    taskContent += `\n---`;
-                }
-
-                const normalizedPath = extractDir.replace(/\\/g, '/');
-                claudeCommand += ` --add-dir "${normalizedPath}"`;
-            } catch (e) {
-                console.error(`[${formatTimestamp()}] [STREAM ERROR] Skill文件解压失败: ${e.message}`);
-            }
-        }
-
-        // 发送开始事件
-        sendEvent('start', { sessionId: effectiveSessionId });
-
-        // 执行 Claude 命令
-        const claudeProcess = spawn('powershell.exe', [
-            '-ExecutionPolicy', 'Bypass',
-            '-Command', claudeCommand
-        ], {
-            shell: false,
-            stdio: ['pipe', 'pipe', 'pipe'],
-            env: { ...process.env, NODE_ENV: 'production' }
-        });
-
-        // 设置超时
-        const timeoutId = setTimeout(() => {
-            if (closed) return;
-            closed = true;
-            claudeProcess.kill();
-            sendEvent('error', { message: '任务执行超时' });
-            res.end();
-            console.log(`[${formatTimestamp()}] [STREAM] 任务执行超时`);
-        }, 600000);
-
-        // 辅助函数：从 Claude stream-json 格式中提取文本内容
-        // 返回 { content, contentType } 或 null
-        // contentType: 'thinking' | 'text' | 'tool_use' | 'result'
-        const extractContent = (parsed) => {
-            // 直接文本输出
-            if (parsed.type === 'result' && parsed.result) {
-                return { content: parsed.result, contentType: 'result' };
-            }
-
-            // assistant 消息，需要从 message.content 数组提取
-            if (parsed.type === 'assistant' && parsed.message?.content) {
-                const results = [];
-                for (const block of parsed.message.content) {
-                    if (block.type === 'thinking' && block.thinking) {
-                        results.push({ content: block.thinking, contentType: 'thinking' });
-                    } else if (block.type === 'text' && block.text) {
-                        results.push({ content: block.text, contentType: 'text' });
-                    } else if (block.type === 'tool_use') {
-                        results.push({
-                            content: `使用工具: ${block.name}`,
-                            contentType: 'tool_use',
-                            toolName: block.name,
-                            toolInput: block.input
-                        });
-                    }
-                }
-                // 如果有多个块，返回第一个（通常只有一个主要块）
-                return results.length > 0 ? results[0] : null;
-            }
-
-            // content_block_delta 类型
-            if (parsed.type === 'content_block_delta' && parsed.delta) {
-                if (parsed.delta.type === 'thinking_delta' && parsed.delta.thinking) {
-                    return { content: parsed.delta.thinking, contentType: 'thinking' };
-                } else if (parsed.delta.type === 'text_delta' && parsed.delta.text) {
-                    return { content: parsed.delta.text, contentType: 'text' };
-                }
-            }
-
-            // 其他情况，返回 null 表示不发送
-            return null;
-        };
-
-        // 实时流式输出 stdout
+        // 处理 stdout
         claudeProcess.stdout.on('data', (data) => {
             const chunk = data.toString();
-            // 尝试解析 stream-json 格式的输出
+            console.log(`[${formatTimestamp()}] [STDOUT] 收到数据长度: ${chunk.length}`);
             const lines = chunk.split('\n').filter(line => line.trim());
+            console.log(`[${formatTimestamp()}] [STDOUT] 解析出 ${lines.length} 行`);
+
             for (const line of lines) {
                 try {
                     const parsed = JSON.parse(line);
+                    console.log(`[${formatTimestamp()}] [STDOUT] 解析类型: ${parsed.type}`);
 
-                    // 跳过 system/init 类型的消息，不需要发送给用户
+                    // 跳过 system 类型的消息
                     if (parsed.type === 'system') {
-                        console.log(`[${formatTimestamp()}] [STREAM] 跳过 system 消息: subtype=${parsed.subtype}`);
                         continue;
                     }
 
-                    // 提取实际内容
                     const extracted = extractContent(parsed);
-                    if (extracted) {
-                        sendEvent('chunk', {
-                            content: extracted.content,
-                            contentType: extracted.contentType,
-                            toolName: extracted.toolName,
-                            toolInput: extracted.toolInput
-                        });
+                    console.log(`[${formatTimestamp()}] [STDOUT] 提取内容类型: ${extracted?.contentType}, 内容长度: ${extracted?.content?.length || 0}`);
+                    if (extracted && extracted.content) {
+                        // 内容去重检查（最小长度 50 字符）
+                        if (isDuplicateContent(effectiveSessionId, extracted.content, 20)) {
+                            console.log(`[${formatTimestamp()}] [DEDUP] 跳过重复内容: ${extracted.contentType}, 长度=${extracted.content.length}`);
+                        } else {
+                            sendEvent(res, 'chunk', {
+                                content: extracted.content,
+                                contentType: extracted.contentType,
+                                toolName: extracted.toolName || '',
+                                toolInput: extracted.toolInput || ''
+                            });
+                        }
                     }
                 } catch (e) {
-                    // 不是 JSON，直接发送原始内容
                     if (line.trim()) {
-                        sendEvent('chunk', { content: line });
+                        sendEvent(res, 'chunk', { content: line });
                     }
                 }
             }
@@ -520,8 +546,7 @@ app.post('/api/task/stream', upload.single('skillFile'), async (req, res) => {
         // 处理 stderr
         claudeProcess.stderr.on('data', (data) => {
             const chunk = data.toString();
-            console.error(`[${formatTimestamp()}] [STREAM STDERR] ${chunk}`);
-            // 不作为错误发送，因为 Claude 可能会在 stderr 输出一些信息性内容
+            console.error(`[${formatTimestamp()}] [STDERR] ${chunk}`);
         });
 
         // 进程结束
@@ -531,18 +556,21 @@ app.post('/api/task/stream', upload.single('skillFile'), async (req, res) => {
             clearTimeout(timeoutId);
 
             const duration = Date.now() - requestStartTime;
+            console.log(`[${formatTimestamp()}] [DONE] 任务执行完成, 耗时: ${duration}ms, 退出码: ${code}`);
 
-            // 清理临时文件
-            if (skillFile && fs.existsSync(skillFile.path)) {
-                fs.unlinkSync(skillFile.path);
-            }
+            // 清理去重集合和隔离工作目录
+            cleanupTempWorkDir(tempWorkDir, effectiveSessionId);
 
             if (code === 0) {
-                console.log(`[${formatTimestamp()}] [STREAM] 任务执行成功，耗时: ${duration}ms`);
-                sendEvent('done', { sessionId: effectiveSessionId, duration });
+                sendEvent(res, 'done', {
+                    sessionId: effectiveSessionId,
+                    duration
+                });
             } else {
-                console.log(`[${formatTimestamp()}] [STREAM] 任务执行失败，退出码: ${code}`);
-                sendEvent('error', { message: `任务执行失败，退出码: ${code}`, sessionId: effectiveSessionId });
+                sendEvent(res, 'error', {
+                    message: `任务执行失败，退出码: ${code}`,
+                    sessionId: effectiveSessionId
+                });
             }
 
             console.log('─'.repeat(60));
@@ -554,8 +582,12 @@ app.post('/api/task/stream', upload.single('skillFile'), async (req, res) => {
             if (closed) return;
             closed = true;
             clearTimeout(timeoutId);
-            console.error(`[${formatTimestamp()}] [STREAM ERROR] 进程错误: ${err.message}`);
-            sendEvent('error', { message: err.message });
+            console.error(`[${formatTimestamp()}] [ERROR] 进程错误: ${err.message}`);
+
+            // 清理去重集合和隔离工作目录
+            cleanupTempWorkDir(tempWorkDir, effectiveSessionId);
+
+            sendEvent(res, 'error', { message: err.message });
             res.end();
         });
 
@@ -563,35 +595,27 @@ app.post('/api/task/stream', upload.single('skillFile'), async (req, res) => {
         claudeProcess.stdin.write(taskContent);
         claudeProcess.stdin.end();
 
-        // 处理客户端断开连接 - 对于 SSE 应该监听 res.on('close')
-        // 注意：req.on('close') 对于 POST 请求会在请求体接收完成时触发，而不是客户端断开时
+        // 处理客户端断开连接
         res.on('close', () => {
             if (!closed) {
-                console.log(`[${formatTimestamp()}] [STREAM] 客户端断开连接 (res.on('close') 触发)`);
+                console.log(`[${formatTimestamp()}] [CLIENT] 客户端断开连接`);
                 closed = true;
                 clearTimeout(timeoutId);
                 claudeProcess.kill();
-            }
-        });
-
-        // 同时监听 socket 关闭事件作为备用
-        req.socket.on('close', () => {
-            if (!closed) {
-                console.log(`[${formatTimestamp()}] [STREAM] Socket 关闭`);
-                closed = true;
-                clearTimeout(timeoutId);
-                claudeProcess.kill();
+                // 清理隔离工作目录
+                cleanupTempWorkDir(tempWorkDir, effectiveSessionId);
             }
         });
 
     } catch (error) {
-        const duration = Date.now() - requestStartTime;
-        console.error(`[${formatTimestamp()}] [STREAM ERROR] ${error.message}`);
-        sendEvent('error', { message: error.message });
-        res.end();
-
-        if (skillFile && fs.existsSync(skillFile.path)) {
-            fs.unlinkSync(skillFile.path);
+        console.error(`[${formatTimestamp()}] [ERROR] ${error.message}`);
+        if (!res.headersSent) {
+            res.status(500).json({ error: error.message });
+        }
+        // 清理隔离工作目录
+        if (typeof effectiveSessionId !== 'undefined') {
+            const tempWorkDir = path.join('uploads', 'sessions', 'session-' + effectiveSessionId);
+            cleanupTempWorkDir(tempWorkDir, effectiveSessionId);
         }
         console.log('─'.repeat(60));
     }
@@ -600,34 +624,23 @@ app.post('/api/task/stream', upload.single('skillFile'), async (req, res) => {
 // 启动服务器
 app.listen(PORT, () => {
     console.log('='.repeat(60));
-    console.log('Claude Code API Server - 危险模式');
+    console.log('Claude Code API Server - 安全模式');
     console.log('='.repeat(60));
     console.log(`服务地址: http://localhost:${PORT}`);
-    console.log(`权限模式: DANGEROUS_MODE (跳过所有权限检查)`);
-    console.log(`Claude标志: ${CLAUDE_FLAGS}`);
-    console.log('');
-    console.log('⚠️  警告: 此模式跳过所有Claude Code权限检查');
-    console.log('⚠️  警告: 所有命令将以最高权限执行');
+    console.log(`安全特性:`);
+    console.log('  - sessionId 格式验证 (只允许 UUID)');
+    console.log('  - 命令参数安全构建 (防止命令注入)');
+    console.log('  - Skill 文件安全解压 (防止路径遍历)');
+    console.log('  - 临时文件定期清理');
     console.log('');
     console.log('可用端点:');
     console.log(`  GET  http://localhost:${PORT}/health                 - 健康检查`);
-    console.log(`  POST http://localhost:${PORT}/api/task                - 通用任务执行接口`);
     console.log(`  POST http://localhost:${PORT}/api/task/stream         - 流式任务执行接口 (SSE)`);
     console.log('');
-    console.log('任务执行接口参数:');
-    console.log('  - taskContent (必填): 任务内容字符串');
-    console.log('  - config (可选): 配置信息JSON');
-    console.log('  - skillFile (可选): Skill文件zip格式');
-    console.log('  - sessionId (可选): 会话ID，用于多轮对话会话持久化');
-    console.log('');
-    console.log('流式接口 (/api/task/stream) 返回 SSE 事件:');
+    console.log('流式接口返回 SSE 事件:');
     console.log('  - start: { type: "start", sessionId: "..." }');
     console.log('  - chunk: { type: "chunk", content: "..." }');
     console.log('  - done:  { type: "done", sessionId: "...", duration: ... }');
-    console.log('  - error: { type: "error", message: "..." }');
-    console.log('');
-    console.log('多轮会话使用方式:');
-    console.log('  1. 首次调用不传 sessionId，响应中会返回新创建的 sessionId');
-    console.log('  2. 后续调用传入该 sessionId，即可恢复之前的对话上下文');
+    console.log('  - error: { type: "error", message: "...", code: "..." }');
     console.log('='.repeat(60));
 });
